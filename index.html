@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Twitch Chat Viewers Dock</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#0e0e10; }
+  body {
+    display:flex; align-items:center; justify-content:flex-start;
+    padding:10px 12px; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+    color:#efeff1;
+  }
+  .pill {
+    display:inline-flex; align-items:center; gap:6px;
+    background:#1f1f23; border:1px solid #2b2b2f; border-radius:8px; padding:6px 10px;
+  }
+  .icon { width:18px; height:18px; fill:#ff4d4d; }
+  .label { font-size:13px; color:#adadb8; margin-right:6px; }
+  .value { font-weight:700; font-size:16px; color:#efeff1; min-width:24px; text-align:right; }
+  .muted { color:#adadb8; font-size:12px; margin-left:10px; }
+</style>
+</head>
+<body>
+  <div class="pill" title="Подсчитывает подключённых к чату (IRC). Это не официальный CCV.">
+    <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 12c2.761 0 5-2.239 5-5s-2.239-5-5-5-5 2.239-5 5 2.239 5 5 5zm0 2c-3.866 0-11 2.015-11 6v2h22v-2c0-3.985-7.134-6-11-6z"/></svg>
+    <span class="label">Зрители (чат):</span>
+    <span id="val" class="value">0</span>
+  </div>
+  <span id="hint" class="muted"></span>
+
+<script>
+(function(){
+  // === ПАРАМЕТРЫ ИЗ URL ===
+  const params = new URLSearchParams(location.search);
+  const channel = (params.get('channel') || '').replace(/^#/, '').trim();
+  const showHint = params.get('hint') !== '0'; // ?hint=0 чтобы спрятать подсказку
+
+  const elVal = document.getElementById('val');
+  const elHint = document.getElementById('hint');
+
+  if (!channel) {
+    elVal.textContent = '—';
+    elHint.textContent = 'Добавьте ?channel=имя_канала к URL';
+    return;
+  }
+  if (showHint) elHint.textContent = `#${channel}`;
+
+  // === ПРОСТОЙ IRC-КЛИЕНТ (анонимный) ===
+  // Подключаемся к Twitch IRC по WebSocket: irc-ws.chat.twitch.tv:443
+  const IRC_URL = 'wss://irc-ws.chat.twitch.tv:443';
+  const NICK = 'justinfan' + Math.floor(Math.random()*1e8); // анонимный клиент
+  const CH = '#' + channel.toLowerCase();
+
+  // Храним активных ников по данным IRC (JOIN/PART + NAMES)
+  const active = new Set();
+
+  let ws, reconnectAttempts = 0, pingTimer, janitorTimer;
+
+  function setCount(n){
+    elVal.textContent = String(n);
+  }
+
+  function connect(){
+    ws = new WebSocket(IRC_URL);
+
+    ws.onopen = () => {
+      reconnectAttempts = 0;
+      // Запрашиваем membership, чтобы получать JOIN/PART и NAMES
+      ws.send('CAP REQ :twitch.tv/membership');
+      ws.send('NICK ' + NICK);
+      ws.send('JOIN ' + CH);
+      // Изредка Twitch шлёт PING — ответим PONG
+      if (pingTimer) clearInterval(pingTimer);
+      pingTimer = setInterval(()=>{ try { ws.send('PING :keepalive'); } catch(_){} }, 60_000);
+      // периодически «чистим» застрявших (подстраховка)
+      if (janitorTimer) clearInterval(janitorTimer);
+      janitorTimer = setInterval(()=>{ setCount(active.size); }, 5_000);
+    };
+
+    ws.onmessage = (ev) => {
+      const data = ev.data;
+      if (typeof data !== 'string') return;
+
+      // Может прийти пачкой из нескольких строк
+      const lines = data.split('\r\n').filter(Boolean);
+      for (const line of lines) {
+        if (line.startsWith('PING')) { try { ws.send('PONG :tmi.twitch.tv'); } catch(_){} continue; }
+
+        // JOIN/PART: :nick!nick@nick.tmi.twitch.tv JOIN #channel
+        if (line.includes(' JOIN ')) {
+          const nick = line.slice(1).split('!')[0];
+          if (nick && nick.toLowerCase() !== NICK.toLowerCase()) {
+            active.add(nick);
+          }
+        }
+        if (line.includes(' PART ')) {
+          const nick = line.slice(1).split('!')[0];
+          if (nick) active.delete(nick);
+        }
+
+        // 353 = NAMES list  (:tmi.twitch.tv 353 <me> = #chan :user1 user2 ...)
+        const parts = line.split(' ');
+        if (parts[1] === '353') {
+          const afterColon = line.split(':');
+          if (afterColon.length >= 3) {
+            const namesStr = afterColon[2];
+            namesStr.split(' ').forEach(raw => {
+              const name = raw.replace(/^[@+]/, '').trim();
+              if (name) active.add(name);
+            });
+          }
+        }
+
+        // 366 = End of NAMES
+        // можно игнорить, просто пересчитаем
+      }
+      setCount(active.size);
+    };
+
+    ws.onerror = () => {/* no-op */};
+
+    ws.onclose = () => {
+      if (pingTimer) clearInterval(pingTimer);
+      if (janitorTimer) clearInterval(janitorTimer);
+      // попытки реконнекта с экспоненциальной задержкой
+      const delay = Math.min(30_000, 1_000 * Math.pow(2, reconnectAttempts++));
+      setTimeout(connect, delay);
+    };
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>
